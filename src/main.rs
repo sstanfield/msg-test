@@ -53,7 +53,8 @@ pub enum ClientMessage {
 
 pub enum BrokerMessage {
     Message(Message),
-    NewClient(ClientTopics, mpsc::Sender<ClientMessage>),
+    NewClient(String, ClientTopics, mpsc::Sender<ClientMessage>),
+    CloseClient(String)
 }
 
 /// A simple `Codec` implementation that reads incoming messages.
@@ -137,15 +138,7 @@ impl Encoder for InMessageCodec {
 
 /// A simple `Codec` implementation that reads incoming client topics.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct ClientTopicsCodec {
-    //topics: Option<ClientTopics>,
-}
-
-/*impl ClientTopicsCodec {
-    pub fn new() -> ClientTopicsCodec {
-        ClientTopicsCodec { topics: None }
-    }
-}*/
+pub struct ClientTopicsCodec { }
 
 impl Decoder for ClientTopicsCodec {
     type Item = ClientIncoming;
@@ -270,12 +263,6 @@ fn new_pub_server(tx_in: mpsc::Sender<BrokerMessage>) -> impl Future<Item=(), Er
                     }
                     Ok(())
                 })
-                // After our copy operation is complete we just print out some helpful
-                // information.
-                .and_then(|()| {
-                    println!("Socket received FIN packet and closed connection");
-                    Ok(())
-                })
                 .or_else(|err| {
                     println!("Socket closed with error: {:?}", err);
                     // We have to return the error to catch it in the next ``.then` call
@@ -296,6 +283,7 @@ fn new_sub_server(tx_in: mpsc::Sender<BrokerMessage>) -> impl Future<Item=(), Er
     let addr_sub = "127.0.0.1:12346".parse().unwrap();
     let listener_sub = TcpListener::bind(&addr_sub)
         .expect("unable to bind sub TCP listener");
+    let mut connections = 0;
 
     // Pull out a stream of sockets for incoming connections
     let server_sub = listener_sub.incoming()
@@ -308,12 +296,14 @@ fn new_sub_server(tx_in: mpsc::Sender<BrokerMessage>) -> impl Future<Item=(), Er
 
             let framed = ClientTopicsCodec{}.framed(socket);
             let (mut writer, reader) = framed.split();
+            connections += 1;
+            let client_name = format!("Client_{}", connections);
 
             let processor = reader
                 .for_each(move |incoming| {
                     match incoming {
                         ClientIncoming::Topic(topics) => {
-                            if let Err(str) = send_wait(&mut tx, BrokerMessage::NewClient(topics, broker_tx.clone())) {
+                            if let Err(str) = send_wait(&mut tx, BrokerMessage::NewClient(client_name.to_string(), topics, broker_tx.clone())) {
                                 if let Err(_) = send_wait(&mut broker_tx, ClientMessage::StatusError(1, str.to_string())) {}
                                 return Err(io::Error::new(io::ErrorKind::Other, str));
                             }
@@ -327,12 +317,6 @@ fn new_sub_server(tx_in: mpsc::Sender<BrokerMessage>) -> impl Future<Item=(), Er
                             }
                         },
                     }
-                    Ok(())
-                })
-                // After our copy operation is complete we just print out some helpful
-                // information.
-                .and_then(|()| {
-                    println!("Socket received FIN packet and closed connection");
                     Ok(())
                 })
                 .or_else(move |err| {
@@ -370,8 +354,8 @@ fn new_sub_server(tx_in: mpsc::Sender<BrokerMessage>) -> impl Future<Item=(), Er
 }
 
 fn new_message_broker(rx: mpsc::Receiver<BrokerMessage>) -> impl Future<Item=(), Error=()> {
-    //let mut clients: Vec<mpsc::Sender<Message>> = vec![];
-    let mut clients: HashMap<String, Vec<mpsc::Sender<ClientMessage>>> = HashMap::new();
+    let mut topic_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut client_tx: HashMap<String, mpsc::Sender<ClientMessage>> = HashMap::new();
     let mut sequences: HashMap<String, usize> = HashMap::new();
     rx.for_each(move |mes| {
         match mes {
@@ -380,24 +364,29 @@ fn new_message_broker(rx: mpsc::Receiver<BrokerMessage>) -> impl Future<Item=(),
                 let seq = sequences.entry(message.topic.to_string()).or_insert(0);
                 message.sequence = *seq;
                 *seq += 1;
-                //if clients.contains_key(&message.topic) {
-                if let Some(mut txs) = clients.get_mut(&message.topic) {
-                    txs.iter_mut().for_each(|tx| {
-                        if let Err(_err) = send_wait(tx, ClientMessage::Message(message.clone())) {
-                            // XXX remove the dead tx...
+                if let Some(mut clients) = topic_map.get_mut(&message.topic) {
+                    clients.iter_mut().for_each(|client| {
+                        if let Some(tx) = client_tx.get_mut(client) {
+                            if let Err(_err) = send_wait(tx, ClientMessage::Message(message.clone())) {
+                                // XXX remove the dead tx...
+                            }
                         }
                     });
                 }
             },
-            BrokerMessage::NewClient(topics, tx) => {
+            BrokerMessage::NewClient(client_name, topics, tx) => {
+                client_tx.insert(client_name.to_string(), tx.clone());
                 for topic in &topics.topics {
                     // insert a key only if it doesn't already exist
-                    clients.entry(topic.to_string()).or_insert(Vec::with_capacity(20));
-                    if let Some(mut txs) = clients.get_mut(topic) {
-                        txs.push(tx.clone());
+                    topic_map.entry(topic.to_string()).or_insert(Vec::with_capacity(20));
+                    if let Some(mut clients) = topic_map.get_mut(topic) {
+                        clients.push(client_name.to_string());
                     }
                 }
             },
+            BrokerMessage::CloseClient(_client_name) => {
+
+            }
         };
         Ok(())
     })
