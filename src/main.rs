@@ -239,7 +239,7 @@ fn send_writer<C: Sink>(writer: &mut C, item: C::SinkItem) -> Result<(), &str> {
 }
 
 fn new_pub_server(tx_in: mpsc::Sender<BrokerMessage>) -> impl Future<Item=(), Error=()> {
-    let addr_pub = "127.0.0.1:12345".parse().unwrap();
+    let addr_pub = "127.0.0.1:7878".parse().unwrap();
     let listener_pub = TcpListener::bind(&addr_pub)
         .expect("unable to bind pub TCP listener");
 
@@ -280,7 +280,7 @@ fn new_pub_server(tx_in: mpsc::Sender<BrokerMessage>) -> impl Future<Item=(), Er
 }
 
 fn new_sub_server(tx_in: mpsc::Sender<BrokerMessage>) -> impl Future<Item=(), Error=()> {
-    let addr_sub = "127.0.0.1:12346".parse().unwrap();
+    let addr_sub = "127.0.0.1:8787".parse().unwrap();
     let listener_sub = TcpListener::bind(&addr_sub)
         .expect("unable to bind sub TCP listener");
     let mut connections = 0;
