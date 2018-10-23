@@ -18,15 +18,36 @@ use futures::sync::mpsc;
 use std::collections::HashMap;
 use std::error::Error;
 
-#[derive(Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+enum MessageType {
+    Message,
+    BatchMessage,
+    BatchEnd { count: usize }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Message {
+    message_type: MessageType,
     topic: String,
     payload_size: usize,
     checksum: String,
-    #[serde(skip)]
     sequence: usize,
-    #[serde(skip)]
     payload: Vec<u8>
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub enum BatchType {
+    Start,
+    End,
+    Count,
+}
+
+fn zero_val() -> usize { 0 }
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum PubIncoming {
+    Message { topic: String, payload_size: usize, checksum: String },
+    Batch { batch_type: BatchType, #[serde(default="zero_val")] count: usize },
 }
 
 #[derive(Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -61,11 +82,15 @@ pub enum BrokerMessage {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct InMessageCodec {
     message: Option<Message>,
+    in_batch: bool,
+    batch_count: usize,
+    expected_batch_count: usize,
+
 }
 
 impl InMessageCodec {
     pub fn new() -> InMessageCodec {
-        InMessageCodec { message: None }
+        InMessageCodec { message: None, in_batch: false, batch_count: 0, expected_batch_count: 0 }
     }
 }
 
@@ -86,39 +111,81 @@ impl Decoder for InMessageCodec {
     type Error = io::Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Message>, io::Error> {
-        let result: Result<Option<Message>, io::Error>;
+        let mut result: Result<Option<Message>, io::Error> = Ok(None);
+        let mut is_batch = false;
         if self.message.is_none() {
             if let Some(brace_offset) = buf[..].iter().position(|b| *b == b'{') {
                 if brace_offset > 0 {
                     buf.advance(brace_offset);
                 }
             }
-            //if let Some(message_offset) = buf[..].iter().position(|b| *b == b'\n') {
             if let Some(message_offset) = last_brace(&buf[..]) {
                 if message_offset > 3 {
                     let line = buf.split_to(message_offset + 1);
-                    //println!("Checking braces, offset 222 [{}]", str::from_utf8(&line[..]).unwrap());
-                    let message: Message = serde_json::from_slice(&line[..])?;
-                    self.message = Some(message);
+                    let incoming: PubIncoming = serde_json::from_slice(&line[..])?;
+                    match incoming {
+                        PubIncoming::Message { topic, payload_size, checksum } => {
+                            let message_type = if self.in_batch {
+                                self.batch_count += 1;
+                                if self.batch_count == self.expected_batch_count {
+                                    self.in_batch = false;
+                                    self.batch_count = 0;
+                                    let count = self.expected_batch_count;
+                                    self.expected_batch_count = 0;
+                                    MessageType::BatchEnd { count }
+                                } else {
+                                    MessageType::BatchMessage
+                                }
+                            } else {
+                                MessageType::Message
+                            };
+                            let message = Message { message_type, topic, payload_size, checksum, sequence: 0, payload: vec![] };
+                            self.message = Some(message);
+                        },
+                        PubIncoming::Batch {batch_type, count} => {
+                            match batch_type {
+                                BatchType::Start => {
+                                    self.in_batch = true;
+                                    result = Ok(None);
+                                },
+                                BatchType::End => {
+                                    self.in_batch = false;
+                                    result = Ok(Some(Message { message_type: MessageType::BatchEnd {count: self.batch_count},
+                                        topic: "".to_string(), payload_size:0, checksum: "".to_string(),
+                                        sequence: 0, payload:vec![] }));
+                                    self.batch_count = 0;
+                                },
+                                BatchType::Count => {
+                                    self.in_batch = true;
+                                    self.batch_count = 0;
+                                    self.expected_batch_count = count;
+                                    result = Ok(None);
+                                }
+                            }
+                            is_batch = true;
+                        }
+                    }
                 }
             }
         }
-        let mut got_payload = false;
-        if let Some(message) = &self.message {
-            let mut message = message.clone();
-            if buf.len() >= message.payload_size {
-                message.payload = buf[..message.payload_size].to_vec();
-                buf.advance(message.payload_size);
-                got_payload = true;
-                result = Ok(Some(message));
+        if !is_batch {
+            let mut got_payload = false;
+            if let Some(message) = &self.message {
+                let mut message = message.clone();
+                if buf.len() >= message.payload_size {
+                    message.payload = buf[..message.payload_size].to_vec();
+                    buf.advance(message.payload_size);
+                    got_payload = true;
+                    result = Ok(Some(message));
+                } else {
+                    result = Ok(None);
+                }
             } else {
                 result = Ok(None);
             }
-        } else {
-            result = Ok(None);
-        }
-        if got_payload {
-            self.message = None;
+            if got_payload {
+                self.message = None;
+            }
         }
         result
     }
@@ -255,11 +322,25 @@ fn new_pub_server(tx_in: mpsc::Sender<BrokerMessage>) -> impl Future<Item=(), Er
 
             let processor = reader
                 .for_each(move |message| {
-                    if let Err(str) = send_writer(&mut writer, "{ \"status\": \"OK\"}".to_string()) {
-                        return Err(io::Error::new(io::ErrorKind::Other, str));
+                    let mut send_message = true;
+                    match message.message_type {
+                        MessageType::Message => {
+                            if let Err(str) = send_writer(&mut writer, "{ \"status\": \"OK\"}".to_string()) {
+                                return Err(io::Error::new(io::ErrorKind::Other, str));
+                            }
+                        },
+                        MessageType::BatchMessage => { },
+                        MessageType::BatchEnd {count} => {
+                            if let Err(str) = send_writer(&mut writer, format!("{{ \"status\": \"OK\", \"count\": {} }}", count).to_string()) {
+                                return Err(io::Error::new(io::ErrorKind::Other, str));
+                            }
+                            if message.payload_size == 0 { send_message = false };
+                        }
                     }
-                    if let Err(str) = send_wait(&mut tx, BrokerMessage::Message(message)) {
-                        return Err(io::Error::new(io::ErrorKind::Other, str));
+                    if send_message {
+                        if let Err(str) = send_wait(&mut tx, BrokerMessage::Message(message)) {
+                            return Err(io::Error::new(io::ErrorKind::Other, str));
+                        }
                     }
                     Ok(())
                 })
